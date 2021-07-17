@@ -15,9 +15,11 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 mod bencode;
+mod dirwalker;
 mod progress;
 mod torrent_meta;
 
+use dirwalker::WalkedDir;
 use progress::ProgressIndicator;
 use torrent_meta::TorrentMetadata as TorrentMetadataV1;
 
@@ -136,17 +138,20 @@ fn main() {
 
     // Directory walk
     let mut progress = ProgressIndicator::new(opts.verbose > 0);
+    let walked_dir = WalkedDir::walk(opts.input, &mut progress).unwrap();
+    if opts.stop_after_dirwalk {
+        return;
+    }
+
+    //
     let mut torrent_meta = TorrentMetadataV1::new(
         tiered_announces,
         nodes,
         opts.private,
         opts.piece_size,
         opts.webseed,
+        walked_dir,
     );
-    torrent_meta.scan(opts.input, &mut progress).unwrap();
-    if opts.stop_after_dirwalk {
-        return;
-    }
 
     // Hash and build BencodeValue
     let meta = if !opts.bep52 {

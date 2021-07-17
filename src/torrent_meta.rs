@@ -1,14 +1,13 @@
 use crate::bencode::BencodeValue;
+use crate::dirwalker::{DataFile, WalkedDir};
 use crate::progress::ProgressIndicator;
 
 use log::*;
 use memmap2::MmapOptions;
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
-use std::fs::{File, Metadata};
+use std::fs::File;
 use std::io;
-use std::path::{Component, Path, PathBuf};
-use walkdir::{DirEntry, WalkDir};
 
 struct Bep3Hasher {
     piece_size: u64,
@@ -64,49 +63,8 @@ impl Bep3Hasher {
     }
 }
 
-struct FileMetadata {
-    path: PathBuf,
-    path_components: Vec<String>,
-    metadata: Metadata,
-}
-
-impl FileMetadata {
-    // Prefix will be stripped away from p to form the "path" list.
-    pub fn new(
-        entry: &DirEntry,
-        prefix: &Path,
-        progress: &mut ProgressIndicator,
-    ) -> io::Result<FileMetadata> {
-        assert!(entry.file_type().is_file());
-        let path = entry.path();
-        let partial_path = path.strip_prefix(prefix).unwrap();
-        debug!("File: {}", partial_path.to_str().unwrap());
-        let mut comp: Vec<String> = vec![];
-        for c in partial_path.components() {
-            match c {
-                Component::Prefix(_) => unimplemented!("Not supported"),
-                Component::RootDir => unimplemented!("Not supported"),
-                Component::CurDir => unreachable!("Should not occurs"),
-                Component::ParentDir => unreachable!("Why .. in path?"),
-                Component::Normal(os_str) => comp.push(
-                    os_str
-                        .to_str()
-                        .expect("Cannot encode path, this is not good")
-                        .to_string(),
-                ),
-            }
-        }
-        progress.scan_progress(partial_path.to_str().unwrap());
-        Ok(FileMetadata {
-            path: path.to_path_buf(),
-            path_components: comp,
-            metadata: path.metadata()?,
-        })
-    }
-}
-
 pub struct TorrentMetadata {
-    files: Vec<FileMetadata>,
+    files: Vec<DataFile>,
     announces: Vec<Vec<String>>,
     piece_size: u64,
     private: bool,
@@ -121,6 +79,7 @@ impl TorrentMetadata {
         private: bool,
         user_piece_size: Option<u64>,
         webseeds: Vec<String>,
+        walked_dir: WalkedDir,
     ) -> Self {
         if let Some(x) = user_piece_size {
             assert!((x & (x - 1)) == 0);
@@ -130,7 +89,7 @@ impl TorrentMetadata {
         assert!(!announces.is_empty() || !nodes.is_empty());
 
         TorrentMetadata {
-            files: vec![],
+            files: walked_dir.files,
             announces,
             piece_size: user_piece_size.unwrap_or(0),
             private,
@@ -139,49 +98,10 @@ impl TorrentMetadata {
         }
     }
 
-    pub fn scan<P: AsRef<Path>>(
+    pub fn hash(
         &mut self,
-        base: P,
         progress: &mut ProgressIndicator,
-    ) -> io::Result<()> {
-        let canonical_path = base.as_ref().canonicalize()?;
-        let prefix = canonical_path.parent().expect("Cannot be a root folder");
-
-        // Walk folder tree
-        progress.scan_begin();
-        let dir_iter = WalkDir::new(canonical_path.clone())
-            .follow_links(true)
-            .into_iter()
-            .filter_entry(|entry| {
-                entry.depth() == 0
-                    || !entry
-                        .file_name()
-                        .to_str()
-                        .map(|s| s.starts_with('.'))
-                        .unwrap_or(false)
-            });
-        for entry in dir_iter {
-            let entry = entry?;
-            if entry.file_type().is_file() {
-                self.files
-                    .push(FileMetadata::new(&entry, prefix, progress)?);
-            }
-        }
-        progress.scan_end();
-
-        // Sort files according to the file tree in bt v2 spec.
-        self.files.sort_by_cached_key(|val| {
-            val.path_components
-                .iter()
-                .map(|s| s.as_bytes().to_vec())
-                .collect::<Vec<_>>()
-        });
-        info!("File list sorted.");
-
-        Ok(())
-    }
-
-    pub fn hash(&mut self, progress: &mut ProgressIndicator) -> io::Result<BencodeValue> {
+    ) -> io::Result<BencodeValue> {
         // Determine piece size
         let total_size = self.files.iter().map(|f| f.metadata.len()).sum();
         self.piece_size = if self.piece_size != 0 {
@@ -202,8 +122,8 @@ impl TorrentMetadata {
             if file_meta.metadata.len() == 0 {
                 hasher.visit_file(b"", progress);
             } else {
-                debug!("Hashing {}...", file_meta.path.display());
-                let f = File::open(&file_meta.path)?;
+                debug!("Hashing {}...", file_meta.entry.path().display());
+                let f = File::open(&file_meta.entry.path())?;
                 let mmap = unsafe { MmapOptions::new().map(&f)? };
                 hasher.visit_file(mmap.as_ref(), progress);
             }
@@ -247,7 +167,9 @@ impl TorrentMetadata {
                 assert_eq!(name, f.path_components[0]);
                 let mut path_vec = vec![];
                 for idx in 1..f.path_components.len() {
-                    path_vec.push(BencodeValue::from(f.path_components[idx].as_ref()));
+                    path_vec.push(BencodeValue::from(
+                        f.path_components[idx].as_ref(),
+                    ));
                 }
                 file.insert(b"path".to_vec(), BencodeValue::List(path_vec));
                 files.push(BencodeValue::Map(file));

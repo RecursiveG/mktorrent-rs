@@ -28,7 +28,9 @@ impl BencodeValue {
 
     fn collect_segments(&self, segments: &mut Vec<u8>) {
         match self {
-            BencodeValue::Integer(i) => segments.extend_from_slice(format!("i{}e", i).as_bytes()),
+            BencodeValue::Integer(i) => {
+                segments.extend_from_slice(format!("i{}e", i).as_bytes())
+            }
             BencodeValue::Bytes(b) => Self::collect_bytes(b, segments),
             BencodeValue::List(l) => {
                 segments.extend_from_slice(b"l");
@@ -83,8 +85,11 @@ mod serialization_test {
     fn list() {
         assert_eq!(BencodeValue::List(vec![]).serialize(), b"le");
         assert_eq!(
-            BencodeValue::List(vec![BencodeValue::Integer(42), BencodeValue::from("foo")])
-                .serialize(),
+            BencodeValue::List(vec![
+                BencodeValue::Integer(42),
+                BencodeValue::from("foo")
+            ])
+            .serialize(),
             b"li42e3:fooe"
         );
         assert_eq!(
