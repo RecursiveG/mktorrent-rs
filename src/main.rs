@@ -18,10 +18,12 @@ mod bencode;
 mod dirwalker;
 mod progress;
 mod torrent_meta;
+mod torrent_meta_v2;
 
 use dirwalker::WalkedDir;
 use progress::ProgressIndicator;
 use torrent_meta::TorrentMetadata as TorrentMetadataV1;
+use torrent_meta_v2::TorrentMetadata as TorrentMetadataV2;
 
 use clap::Clap;
 use log::*;
@@ -51,9 +53,20 @@ struct CliOptions {
     /// Output torrent file.
     #[clap(short, long)]
     output: String,
+
     /// Bytes of each piece. Must be a power of 2. 16KB minimal. Leave unset for auto.
     #[clap(short, long)]
     piece_size: Option<u64>,
+    /// Do not generate BEP-3 (BitTorrent v1) metadata.
+    #[clap(long)]
+    no_bep3: bool,
+    /// Do not generate BEP-52 (BitTorrent v2) metadata.
+    #[clap(long)]
+    no_bep52: bool,
+    /// Do not generate BEP-47 padding files.
+    #[clap(long)]
+    no_padding: bool,
+
     /// Specify tracker URLs. Use this option multiple times to specify
     /// mutiple tiers. Use comma to split trackers in the same tier.
     #[clap(short, long)]
@@ -63,24 +76,85 @@ struct CliOptions {
     /// Use this option multiple times to include multiple nodes.
     #[clap(short, long)]
     node: Vec<String>,
-    /// Create file in BEP-52 (BitTorrent v2) format.
-    #[clap(long)]
-    bep52: bool,
     /// Mark torrent as private.
     #[clap(long)]
     private: bool,
+    /// WebSeed(BEP19) URLs. Use this option can be used multiple times.
+    #[clap(long)]
+    webseed: Vec<String>,
+
     /// A level of verbosity, and can be used multiple times.
     #[clap(short, long, parse(from_occurrences))]
     verbose: i32,
+    /// use multiple thread for hash computation.
+    #[clap(long, default_value = "1")]
+    threads: u64,
+
     /// (debug) stop after dir walk.
     #[clap(long)]
     stop_after_dirwalk: bool,
     /// (debug) stop after hash.
     #[clap(long)]
     stop_after_hash: bool,
-    /// WebSeed(BEP19) URLs. Use this option can be used multiple times.
-    #[clap(long)]
-    webseed: Vec<String>,
+}
+
+impl CliOptions {
+    fn check(&self) -> Result<(), String> {
+        if self.no_bep3 && self.no_bep52 {
+            return Err("At least one bep3/bep52".into());
+        }
+        if self.announce.is_empty() && self.node.is_empty() {
+            return Err(
+                "Please specify tracker/node URL using --announce/--node"
+                    .into(),
+            );
+        }
+        if let Some(x) = self.piece_size {
+            if x < 16 * 1024 {
+                return Err("Piece size too small".into());
+            }
+            if x > 2 * 1024 * 1024 {
+                return Err("Piece size too large".into());
+            }
+            if (x & (x - 1)) != 0 {
+                return Err("Piece size is not a power of 2".into());
+            }
+        }
+        if self.threads < 1 {
+            return Err("are you kidding me running with 0 thread?".into());
+        }
+        if self.no_padding {
+            if !self.no_bep52 || self.threads != 1 || self.no_bep3 {
+                return Err(
+                    "no_padding is incompatible with bep52 and threads.".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_announces(&self) -> Vec<Vec<String>> {
+        self.announce
+            .iter()
+            .map(|s| s.split(',').map(str::to_string).collect())
+            .collect()
+    }
+
+    fn parse_nodes(&self) -> Result<Vec<(String, u16)>, String> {
+        let mut nodes = vec![];
+        for host_port in &self.node {
+            match split_host_port(host_port.as_str()) {
+                Some(x) => {
+                    debug!("Node host={} port={}", x.0, x.1);
+                    nodes.push(x)
+                }
+                None => {
+                    return Err(format!("Invalid node: {}", host_port));
+                }
+            }
+        }
+        Ok(nodes)
+    }
 }
 
 fn main() {
@@ -92,49 +166,19 @@ fn main() {
         .init()
         .unwrap();
 
-    if opts.bep52 {
-        unimplemented!("BitTorrent v2 format is not implemented.");
-    }
-    if opts.announce.is_empty() && opts.node.is_empty() {
-        error!("Please specify tracker/node URL using --announce/--node");
+    if let Err(e) = opts.check() {
+        error!("{}", e);
         return;
     }
-
-    if let Some(x) = opts.piece_size {
-        if x < 16 * 1024 {
-            error!("Piece size too small");
-            return;
-        }
-        if x > 2 * 1024 * 1024 {
-            error!("Piece size too large");
-            return;
-        }
-        if (x & (x - 1)) != 0 {
-            error!("Piece size is not a power of 2");
-            return;
-        }
-    }
-
-    // Argument parsing
-    let tiered_announces = opts
-        .announce
-        .iter()
-        .map(|s| s.split(',').map(str::to_string).collect())
-        .collect();
+    let tiered_announces = opts.parse_announces();
     debug!("Tiered announce URLs:\n{:#?}", tiered_announces);
-    let mut nodes = vec![];
-    for host_port in opts.node {
-        match split_host_port(host_port.as_str()) {
-            Some(x) => {
-                debug!("Node host={} port={}", x.0, x.1);
-                nodes.push(x)
-            }
-            None => {
-                error!("Invalid node: {}", host_port);
-                return;
-            }
+    let nodes = match opts.parse_nodes() {
+        Ok(n) => n,
+        Err(s) => {
+            error!("{}", s);
+            return;
         }
-    }
+    };
 
     // Directory walk
     let mut progress = ProgressIndicator::new(opts.verbose > 0);
@@ -143,21 +187,33 @@ fn main() {
         return;
     }
 
-    //
-    let mut torrent_meta = TorrentMetadataV1::new(
-        tiered_announces,
-        nodes,
-        opts.private,
-        opts.piece_size,
-        opts.webseed,
-        walked_dir,
-    );
-
-    // Hash and build BencodeValue
-    let meta = if !opts.bep52 {
+    // Create torrent metadata and calc hash
+    let meta = if opts.no_padding {
+        let mut torrent_meta = TorrentMetadataV1::new(
+            tiered_announces,
+            nodes,
+            opts.private,
+            opts.piece_size,
+            opts.webseed,
+            walked_dir,
+        );
         torrent_meta.hash(&mut progress).unwrap()
     } else {
-        unreachable!()
+        let mut v2 = TorrentMetadataV2::new(
+            tiered_announces,
+            nodes,
+            opts.private,
+            opts.piece_size,
+            opts.webseed,
+            walked_dir,
+        );
+        v2.hash(
+            &mut progress,
+            opts.threads as u32,
+            !opts.no_bep3,
+            !opts.no_bep52,
+        )
+        .unwrap()
     };
     if opts.stop_after_hash {
         return;

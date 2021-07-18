@@ -8,7 +8,8 @@ Supported BEPs:
 - BEP12: Multitracker Metadata Extension
 - BEP19: WebSeed
 - BEP27: Private Torrents
-- BEP52: \[WIP]The BitTorrent spec v2
+- BEP47: \[partial] Padding file
+- BEP52: The BitTorrent spec v2
 
 ## LICENSE
 

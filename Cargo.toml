@@ -10,6 +10,8 @@ walkdir = "2.3.2" # MIT
 clap = "3.0.0-beta.2" # MIT
 memmap2 = "0.3.0" # MIT
 sha-1 = "0.9.6" # MIT
+sha2 = "0.9.5" # MIT
+crossbeam = "0.8.1" # MIT
 
 [dependencies.indicatif] # MIT
 git = 'https://github.com/mitsuhiko/indicatif'
